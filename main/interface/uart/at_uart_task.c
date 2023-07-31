@@ -34,6 +34,20 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
+#include "esp_bt.h"
+#include "esp_hf_client_api.h"
+#include "esp_bt_device.h"
+#include "esp_gap_bt_api.h"
+
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include "lwip/netdb.h"
+#include "lwip/dns.h"
+
 #ifdef CONFIG_AT_BASE_ON_UART
 #include "esp_system.h"
 #include "driver/gpio.h"
@@ -133,6 +147,7 @@ static uart_port_t esp_at_uart_port = CONFIG_AT_UART_PORT;
 static bool at_nvm_uart_config_set (at_nvm_uart_config_struct *uart_config);
 static bool at_nvm_uart_config_get (at_nvm_uart_config_struct *uart_config);
 
+static const char *TAG = "HTTP-AT";
 
 static int32_t at_port_write_data(uint8_t*data,int32_t len)
 {
@@ -502,6 +517,148 @@ static bool at_nvm_uart_config_get (at_nvm_uart_config_struct *uart_config)
     return true;
 }
 
+static void http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_path)
+{
+    const struct addrinfo hints = {
+    .ai_family = AF_INET,
+    .ai_socktype = SOCK_STREAM,
+    };
+    struct addrinfo *res;
+    struct in_addr  *addr;
+    int s, r, rlen;
+    char recv_buf[512 + 6] = {0};
+    char request[256] = {0};
+    char *p = NULL;
+
+    sprintf(request, "GET %s HTTP/1.0\r\nHost: %s:%s\r\nUser-Agent: esp-idf/1.0 esp32\r\n\r\n",web_path, web_host, web_port);
+    //ESP_LOGI(TAG, "%s", request);
+    //ESP_LOGI(TAG, "%s", REQUEST);
+    
+    int err = getaddrinfo((char*)web_host, (char*)web_port, &hints, &res);
+    if (err != 0 || res == NULL) {
+    ESP_LOGI(TAG, "DNS lookup failed err=%d res=%p", err, res);
+    }
+    addr = &((struct sockaddr_in *)res->ai_addr)->sin_addr;
+    ESP_LOGI(TAG, "DNS lookup successed. IP=%s", inet_ntoa(*addr));
+   
+    s = socket(res->ai_family, res->ai_socktype, 0);
+    if (s < 0) {
+    ESP_LOGE(TAG, "...Failed to allocate socket.");
+    freeaddrinfo(res);
+    }
+    
+    if (connect(s, res->ai_addr, res->ai_addrlen) != 0) {
+    ESP_LOGE(TAG, "...socket connect failed error=%d", errno);
+    close(s);
+    freeaddrinfo(res);
+    }
+
+    ESP_LOGI(TAG, "...connected");
+    freeaddrinfo(res);
+
+    if (write(s, request, strlen(request)) < 0) {
+    ESP_LOGE(TAG, "...socket send failed");
+    close(s);
+    }
+    ESP_LOGI(TAG, "...socket send success");
+    
+    struct timeval receiving_timeout;
+    receiving_timeout.tv_sec = 5;
+    receiving_timeout.tv_usec = 0;
+    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &receiving_timeout, sizeof(receiving_timeout)) < 0) {
+    ESP_LOGE(TAG, "...failed to set socket receiving timeout");
+    close(s);
+    }
+    ESP_LOGI(TAG, "...set socket receiving timeout success");
+
+    //parse first packet data
+    rlen = 0;
+    r = read(s, recv_buf, 512);
+    p = strstr(recv_buf, "\r\n\r\n");
+    if(p + 4!= NULL)
+    {
+    rlen = r - (p + 4 - recv_buf);
+    }
+    if (rlen < 0)
+    rlen = 0;
+    esp_at_port_write_data((uint8_t*)recv_buf, r - rlen);
+    esp_at_port_write_data((uint8_t *)"\r\nOK\r\n", 6);
+    vTaskDelay(50/portTICK_PERIOD_MS);
+    
+    //fill second packet data
+    memcpy(recv_buf, "+HTTPP", 6);
+    if (p + 4 != NULL)
+        memcpy(recv_buf + 6, p + 4, rlen); 
+    r = read(s, recv_buf + 6 + rlen, 512 - rlen);
+    esp_at_port_write_data((uint8_t*)recv_buf, r + 6 + rlen);
+    vTaskDelay(50/portTICK_PERIOD_MS);
+    
+    do {
+    bzero(recv_buf, sizeof(recv_buf));
+        memcpy(recv_buf, "+HTTPP", 6);
+    r = read(s, recv_buf + 6, 512);
+    if (r <= 512 && r > 0)
+        esp_at_port_write_data((uint8_t*)recv_buf, r + 6);
+    vTaskDelay(50/portTICK_PERIOD_MS);
+    }while(r > 0);
+    
+    ESP_LOGI(TAG, "...done reading from socket. Last read return = %d errno = %d.", r, errno);
+    close(s);
+
+}
+
+static uint8_t at_queryCmdMaster(uint8_t *cmd_name)
+{
+    //reject call 
+    //esp_hf_client_reject_call();
+    //http_get_param();
+    //esp_at_port_write_data(REQUEST, strlen((char*)REQUEST));
+    return ESP_AT_RESULT_CODE_OK;
+}
+
+static uint8_t at_setupCmdMaster(uint8_t para_num)
+{
+    char *web_url;
+    char web_path[128] = {0};
+    char web_port[8] = {0};
+    char web_host[128] = {0};
+    int32_t cnt = 0;
+    char *p1, *p2;
+
+    if (esp_at_get_para_as_str(cnt++, &web_url) != ESP_AT_PARA_PARSE_RESULT_OK)
+    {
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+
+    p1 = strstr(web_url, "//");
+    if (NULL != p1)
+    {
+        p2 = strstr((p1 + 2), "/");
+        if (NULL != p2){
+            memcpy(web_host, p1 + 2, p2 - p1 -2);
+        } else {
+            return ESP_AT_RESULT_CODE_ERROR;
+        }
+
+        if (NULL != (p2 + 1))
+        {
+           // web_path[0] = '/';
+            strcpy(web_path, p2);
+        } else {
+            return ESP_AT_RESULT_CODE_ERROR;
+        }
+        strcpy(web_port, "80");
+
+    } else {
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+
+    http_get_param((uint8_t *)web_host, (uint8_t *)web_port, (uint8_t *)web_path);
+
+    return ESP_AT_RESULT_CODE_OK;
+}
+
+
 static uint8_t at_setupCmdUart(uint8_t para_num)
 {
     int32_t value = 0;
@@ -643,6 +800,7 @@ static const esp_at_cmd_struct at_custom_cmd[] = {
     {"+UART", NULL, at_queryCmdUart, at_setupCmdUartDef, NULL},
     {"+UART_CUR", NULL, at_queryCmdUart, at_setupCmdUart, NULL},
     {"+UART_DEF", NULL, at_queryCmdUartDef, at_setupCmdUartDef, NULL},
+    {"+HTTPP", NULL, at_queryCmdMaster, at_setupCmdMaster, NULL},
 };
 
 void at_status_callback (esp_at_status_type status)
