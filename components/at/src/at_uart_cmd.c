@@ -16,6 +16,20 @@
 #include "esp_at.h"
 #include "at_uart.h"
 
+#include "esp_bt.h"
+#include "esp_hf_client_api.h"
+#include "esp_bt_device.h"
+#include "esp_gap_bt_api.h"
+
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include "lwip/netdb.h"
+#include "lwip/dns.h"
+
 static const char *TAG = "HTTP-AT";
 
 static uint8_t at_setup_cmd_uart_common(uint8_t para_num, bool save_to_flash)
