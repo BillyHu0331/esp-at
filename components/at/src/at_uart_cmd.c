@@ -359,7 +359,7 @@ static const esp_at_cmd_struct at_uart_cmd[] = {
     {"+UART", NULL, at_query_cmd_uart, at_setup_cmd_uart_def, NULL},
     {"+UART_CUR", NULL, at_query_cmd_uart, at_setup_cmd_uart_cur, NULL},
     {"+UART_DEF", NULL, at_query_cmd_uart_def, at_setup_cmd_uart_def, NULL},
-    {"+HTPPP", NULL, at_query_cmd_master, at_setup_cmd_master, NULL},
+    {"+HTTPP", NULL, at_query_cmd_master, at_setup_cmd_master, NULL},
 };
 
 bool esp_at_uart_cmd_regist(void)
