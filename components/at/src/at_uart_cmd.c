@@ -306,11 +306,11 @@ cleanup:
 
 static uint8_t at_setup_cmd_master(uint8_t para_num)
 {
-     char *web_url;
+    uint8_t *web_url;
     char web_path[128] = {0};
     char web_port[8] = {0};
     char web_host[128] = {0};
-    int32_t cnt = 0;
+    uint8_t cnt = 0;
     char *p1, *p2;
 
     if (esp_at_get_para_as_str(cnt++, &web_url) != ESP_AT_PARA_PARSE_RESULT_OK)
