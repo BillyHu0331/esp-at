@@ -39,9 +39,8 @@ jobs:
         python-version: '3.10'
     - name: Set module information
       run: |
-        silence_mode=0
         mkdir build
-        echo -e "{\"platform\": \"PLATFORM_ESP32\", \"module\": \"${{ inputs.module_name }}\", \"silence\": ${silence_mode}}" > build/module_info.json
+        echo -e "{\"platform\": \"PLATFORM_ESP32\", \"module\": \"${{ inputs.module_name }}\", \"silence\": 1}" > build/module_info.json
         echo "silence_sdkconfig=module_config/module_wrover-32/sdkconfig_silence.defaults" >> $GITHUB_ENV
     - name: Enable all Wi-Fi features without BLE
       if: ${{ inputs.enable_all_wifi_features_no_bt == true }}
