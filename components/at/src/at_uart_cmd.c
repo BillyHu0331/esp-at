@@ -318,11 +318,11 @@ static uint8_t at_setup_cmd_master(uint8_t para_num)
         return ESP_AT_RESULT_CODE_ERROR;
     }
 
-    if ((web_url == NULL) || (strchr(((char *))web_url, '\r') != NULL) || (strchr(((char *))web_url, '\n') != NULL)) {
+    if ((web_url == NULL) || (strchr((char *)web_url, '\r') != NULL) || (strchr((char *)web_url, '\n') != NULL)) {
         return ESP_AT_RESULT_CODE_ERROR;
     }
 
-    p1 = strstr(((char *))web_url, "//");
+    p1 = strstr((char *)web_url, "//");
     if (NULL != p1)
     {
         p2 = strstr((p1 + 2), "/");
