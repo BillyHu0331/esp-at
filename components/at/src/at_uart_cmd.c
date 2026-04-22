@@ -24,14 +24,13 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
-
-// 引入 HTTP Client 相關頭文件
-#include "esp_http_client.h"
-#include "esp_crt_bundle.h"
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include "lwip/netdb.h"
+#include "lwip/dns.h"
 
 static const char *TAG = "HTTP-AT";
-// #define MAX_UART_CHUNK_SIZE 512
-// #define HTTPP_OUT_DELAY_MS  50
 
 static uint8_t at_setup_cmd_uart_common(uint8_t para_num, bool save_to_flash)
 {
@@ -180,128 +179,208 @@ static uint8_t at_query_cmd_uart_def(uint8_t *cmd_name)
     return ESP_AT_RESULT_CODE_OK;
 }
 
-#define MAX_UART_CHUNK_SIZE 512
-#define MAX_DATA_PER_CHUNK  MAX_UART_CHUNK_SIZE  // 純數據最大 512
-#define PREFIX_STR          "+HTTPP"
-#define PREFIX_LEN          6
-#define HTTPP_OUT_DELAY_MS  50
-
-static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
+static uint8_t at_query_cmd_httpp(uint8_t *cmd_name)
 {
-    switch(evt->event_id) {
-        case HTTP_EVENT_ON_HEADER:
-            // Header 部分通常按原樣輸出，方便除錯
-            if (evt->header_key && evt->header_value) {
-                char head_buf[512];
-                int len = snprintf(head_buf, sizeof(head_buf), "%s: %s\r\n", evt->header_key, evt->header_value);
-                if (len > 0) {
-                    esp_at_port_write_data((uint8_t *)head_buf, len);
-                    vTaskDelay(pdMS_TO_TICKS(HTTPP_OUT_DELAY_MS));
-                }
-            }
-            break;
-
-        case HTTP_EVENT_ON_DATA:
-            if (evt->data_len > 0) {
-                int data_left = evt->data_len;
-                uint8_t *data_ptr = (uint8_t *)evt->data;
-
-                // 準備一個足以容納 前綴 + 數據 的緩衝區
-                // 使用 static 或從堆分配以減輕棧負擔，這裡演示用棧（請確保任務棧 > 2KB）
-                uint8_t send_buf[PREFIX_LEN + MAX_DATA_PER_CHUNK];
-
-                while (data_left > 0) {
-                    int copy_len = (data_left > MAX_DATA_PER_CHUNK) ? MAX_DATA_PER_CHUNK : data_left;
-
-                    // 1. 組裝數據包：前綴 + 數據內容
-                    memcpy(send_buf, PREFIX_STR, PREFIX_LEN);
-                    memcpy(send_buf + PREFIX_LEN, data_ptr, copy_len);
-
-                    // 2. 一次性發送整包 (Prefix + Data)
-                    esp_at_port_write_data(send_buf, PREFIX_LEN + copy_len);
-
-                    // 3. 強制延遲，保證接收端處理時間
-                    vTaskDelay(pdMS_TO_TICKS(HTTPP_OUT_DELAY_MS));
-
-                    // 指標偏移
-                    data_ptr += copy_len;
-                    data_left -= copy_len;
-                }
-            }
-            break;
-
-        default:
-            break;
-    }
-    return ESP_OK;
+    return ESP_AT_RESULT_CODE_OK;
 }
 
-/**
- * @brief 執行 HTTP 請求的核心邏輯，並回傳執行狀態
- */
-static esp_err_t http_perform_request(const char *url)
+static void http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_path)
 {
-    esp_http_client_config_t config = {
-        .url = url,
-        .event_handler = _http_event_handler,
-        .crt_bundle_attach = esp_crt_bundle_attach, // 支援 HTTPS
-        .timeout_ms = 10000,
-        .method = HTTP_METHOD_GET,
-        .buffer_size = MAX_UART_CHUNK_SIZE,
+    const struct addrinfo hints = {
+        .ai_family = AF_INET,
+        .ai_socktype = SOCK_STREAM,
     };
+    struct addrinfo *res = NULL;
+    struct in_addr  *addr;
+    int s = -1, r;
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
-        ESP_LOGE(TAG, "HTTP client init failed");
-        return ESP_FAIL;
+    // 擴大 Request Buffer，防止長 URL 導致棧溢出
+    char request[256] = {0}; 
+    int req_len = snprintf(request, sizeof(request), "GET %s HTTP/1.0\r\nHost: %s:%s\r\nUser-Agent: esp-idf/1.0 esp32\r\n\r\n", web_path, web_host, web_port);
+    if ((req_len < 0) || (req_len >= sizeof(request))) {
+        ESP_LOGE(TAG, "request too long");
+        return;
+    }
+    size_t request_len = (size_t)req_len;
+
+    int err = getaddrinfo((char*)web_host, (char*)web_port, &hints, &res);
+    if (err != 0 || res == NULL) {
+        ESP_LOGI(TAG, "DNS lookup failed err=%d res=%p", err, res);
+        return;
+    }
+    addr = &((struct sockaddr_in *)res->ai_addr)->sin_addr;
+    ESP_LOGI(TAG, "DNS lookup successed. IP=%s", inet_ntoa(*addr));
+   
+    s = socket(res->ai_family, res->ai_socktype, 0);
+    if (s < 0) {
+        ESP_LOGE(TAG, "...Failed to allocate socket.");
+        goto cleanup;
+    }
+    
+    if (connect(s, res->ai_addr, res->ai_addrlen) != 0) {
+        ESP_LOGE(TAG, "...socket connect failed error=%d", errno);
+        goto cleanup;
     }
 
-    esp_err_t err = esp_http_client_perform(client);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
+    ESP_LOGI(TAG, "...connected");
+    freeaddrinfo(res);
+    res = NULL;
+
+    size_t sent_len = 0;
+    while (sent_len < request_len) {
+        int write_len = write(s, request + sent_len, request_len - sent_len);
+        if (write_len <= 0) {
+            ESP_LOGE(TAG, "...socket send failed");
+            goto cleanup;
+        }
+        sent_len += (size_t)write_len;
+    }
+    ESP_LOGI(TAG, "...socket send success");
+    
+    struct timeval receiving_timeout;
+    receiving_timeout.tv_sec = 5;
+    receiving_timeout.tv_usec = 0;
+    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &receiving_timeout, sizeof(receiving_timeout)) < 0) {
+        ESP_LOGE(TAG, "...failed to set socket receiving timeout");
+        goto cleanup;
     }
 
-    // 獲取 HTTP 狀態碼 (可選功能，方便除錯)
-    int status_code = esp_http_client_get_status_code(client);
-    ESP_LOGI(TAG, "HTTP Status Code: %d", status_code);
+    // HTTP 解析狀態機配置
+    char recv_buf[512 + 6] = {0};
+    char *data_buf = recv_buf + 6; // 預留前 6 Bytes 給 "+HTTPP" 使用
+    bool header_done = false;
+    uint8_t match_state = 0;
 
-    esp_http_client_cleanup(client);
-    return err;
+    // 循環讀取 Socket，直到對端關閉連接或超時
+    while ((r = read(s, data_buf, 512)) > 0) {
+        if (!header_done) {
+            int i;
+            for (i = 0; i < r; i++) {
+                // 狀態機：精準捕獲 \r\n\r\n 邊界，完美解決跨包截斷問題
+                if (data_buf[i] == '\r' && match_state == 0) match_state = 1;
+                else if (data_buf[i] == '\n' && match_state == 1) match_state = 2;
+                else if (data_buf[i] == '\r' && match_state == 2) match_state = 3;
+                else if (data_buf[i] == '\n' && match_state == 3) {
+                    match_state = 4;
+                    header_done = true;
+                    i++; // 將指針移向 Body 的首字節
+                    break;
+                } else {
+                    if (data_buf[i] == '\r') match_state = 1; // 容錯處理 \r\r\n
+                    else match_state = 0;
+                }
+            }
+
+            if (header_done) {
+                // 1. 輸出最後一部分的 Header
+                if (i > 0) {
+                    esp_at_port_write_data((uint8_t*)data_buf, i);
+                }
+                // 2. 插入分隔標記
+                esp_at_port_write_data((uint8_t *)"\r\nOK\r\n", 6);
+
+                // 3. 如果這個封包已經包含了部分 Body 數據，將其拋出
+                if (i < r) {
+                    int body_len = r - i;
+                    esp_at_port_write_data((uint8_t *)"+HTTPP", 6);
+                    esp_at_port_write_data((uint8_t *)(data_buf + i), body_len);
+                    vTaskDelay(50/portTICK_PERIOD_MS);
+                }
+            } else {
+                // 整個封包都還是 Header
+                esp_at_port_write_data((uint8_t*)data_buf, r);
+                vTaskDelay(50/portTICK_PERIOD_MS);
+            }
+            
+        } else {
+            // Header 已處理完畢，純 Body 透傳
+            // 直接在預留的內存前綴寫入 "+HTTPP"，減少一次內存搬運
+            memcpy(recv_buf, "+HTTPP", 6);
+            esp_at_port_write_data((uint8_t*)recv_buf, r + 6);
+            vTaskDelay(50/portTICK_PERIOD_MS);
+        }
+        
+        // 給 FreeRTOS 其他任務 (如 AT Parser 本身) 釋放時間片
+    }
+
+    ESP_LOGI(TAG, "...done reading from socket. Last read return = %d errno = %d.", r, errno);
+
+cleanup:
+    if (res != NULL) {
+        freeaddrinfo(res);
+    }
+    if (s >= 0) {
+        close(s);
+    }
 }
 
-/**
- * @brief AT+HTTPP=<url> 指令處理函數
- */
 static uint8_t at_setup_cmd_httpp(uint8_t para_num)
 {
-    uint8_t *url_ptr;
-    
-    // 從參數中提取 URL 字符串
-    if (esp_at_get_para_as_str(0, &url_ptr) != ESP_AT_PARA_PARSE_RESULT_OK) {
+    uint8_t *web_url;
+    char web_path[256] = {0}; // 擴大 Buffer 避免長路徑溢出
+    char web_port[8] = "80";  // 預設 Port 為 80
+    char web_host[256] = {0};
+    uint8_t cnt = 0;
+    char *p_host_start;
+    char *p_path_start;
+
+    if (esp_at_get_para_as_str(cnt++, &web_url) != ESP_AT_PARA_PARSE_RESULT_OK) {
         return ESP_AT_RESULT_CODE_ERROR;
     }
 
-    if (url_ptr == NULL || strlen((char *)url_ptr) == 0) {
+    if ((web_url == NULL) || (strchr((char *)web_url, '\r') != NULL) || (strchr((char *)web_url, '\n') != NULL)) {
         return ESP_AT_RESULT_CODE_ERROR;
     }
 
-    // 呼叫重構後的請求邏輯，並根據結果回傳對應的 AT 狀態
-    esp_err_t err = http_perform_request((char *)url_ptr);
-    
-    if (err == ESP_OK) {
-        // 底層框架會自動在最後補上 \r\nOK\r\n
-        return ESP_AT_RESULT_CODE_OK; 
+    // 1. 過濾掉 "://" 前綴 (如果存在)
+    p_host_start = strstr((char *)web_url, "://");
+    if (p_host_start) {
+        p_host_start += 3;
     } else {
-        // 底層框架會補上 \r\nERROR\r\n
-        return ESP_AT_RESULT_CODE_ERROR; 
+        p_host_start = (char *)web_url; 
     }
+
+    // 2. 尋找 Path 的起點 '/'
+    p_path_start = strchr(p_host_start, '/');
+
+    size_t host_len;
+    if (p_path_start) {
+        host_len = p_path_start - p_host_start;
+        size_t path_len = strlen(p_path_start);
+        if (path_len >= sizeof(web_path)) {
+            return ESP_AT_RESULT_CODE_ERROR;
+        }
+        strncpy(web_path, p_path_start, path_len);
+        web_path[path_len] = '\0';
+    } else {
+        // 沒有 '/' 的情況 (如 http://example.com)
+        host_len = strlen(p_host_start);
+        strcpy(web_path, "/"); 
+    }
+
+    if (host_len == 0 || host_len >= sizeof(web_host)) {
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+    strncpy(web_host, p_host_start, host_len);
+    web_host[host_len] = '\0';
+
+    // 3. 檢查是否包含自定義 Port (例如 host:8080)
+    char *p_port = strchr(web_host, ':');
+    if (p_port) {
+        *p_port = '\0'; // 截斷 Host 字串
+        strncpy(web_port, p_port + 1, sizeof(web_port) - 1);
+    }
+
+    http_get_param((uint8_t *)web_host, (uint8_t *)web_port, (uint8_t *)web_path);
+
+    return ESP_AT_RESULT_CODE_OK;
 }
 
 static const esp_at_cmd_struct at_uart_cmd[] = {
     {"+UART", NULL, at_query_cmd_uart, at_setup_cmd_uart_def, NULL},
     {"+UART_CUR", NULL, at_query_cmd_uart, at_setup_cmd_uart_cur, NULL},
     {"+UART_DEF", NULL, at_query_cmd_uart_def, at_setup_cmd_uart_def, NULL},
-    {"+HTTPP", NULL, NULL, at_setup_cmd_httpp, NULL},
+    {"+HTTPP", NULL, at_query_cmd_httpp, at_setup_cmd_httpp, NULL},
 };
 
 bool esp_at_uart_cmd_regist(void)
