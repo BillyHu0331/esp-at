@@ -30,7 +30,8 @@
 #include "esp_crt_bundle.h"
 
 static const char *TAG = "HTTP-AT";
-#define HTTPP_OUT_DELAY_MS  50
+// #define MAX_UART_CHUNK_SIZE 512
+// #define HTTPP_OUT_DELAY_MS  50
 
 static uint8_t at_setup_cmd_uart_common(uint8_t para_num, bool save_to_flash)
 {
@@ -179,7 +180,8 @@ static uint8_t at_query_cmd_uart_def(uint8_t *cmd_name)
     return ESP_AT_RESULT_CODE_OK;
 }
 
-#define MAX_DATA_PER_CHUNK  512  // 純數據最大 512
+#define MAX_UART_CHUNK_SIZE 512
+#define MAX_DATA_PER_CHUNK  MAX_UART_CHUNK_SIZE  // 純數據最大 512
 #define PREFIX_STR          "+HTTPP"
 #define PREFIX_LEN          6
 #define HTTPP_OUT_DELAY_MS  50
@@ -234,23 +236,37 @@ static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-static void http_perform_request(const char *url)
+/**
+ * @brief 執行 HTTP 請求的核心邏輯，並回傳執行狀態
+ */
+static esp_err_t http_perform_request(const char *url)
 {
     esp_http_client_config_t config = {
         .url = url,
         .event_handler = _http_event_handler,
-        .crt_bundle_attach = esp_crt_bundle_attach,
+        .crt_bundle_attach = esp_crt_bundle_attach, // 支援 HTTPS
         .timeout_ms = 10000,
         .method = HTTP_METHOD_GET,
-        // 設定 Buffer 為 512，讓底層儘可能以 512 為單位觸發事件
-        .buffer_size = MAX_UART_CHUNK_SIZE, 
+        .buffer_size = MAX_UART_CHUNK_SIZE,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client) {
-        esp_http_client_perform(client);
-        esp_http_client_cleanup(client);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "HTTP client init failed");
+        return ESP_FAIL;
     }
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
+    }
+
+    // 獲取 HTTP 狀態碼 (可選功能，方便除錯)
+    int status_code = esp_http_client_get_status_code(client);
+    ESP_LOGI(TAG, "HTTP Status Code: %d", status_code);
+
+    esp_http_client_cleanup(client);
+    return err;
 }
 
 /**
