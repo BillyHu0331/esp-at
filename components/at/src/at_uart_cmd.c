@@ -39,7 +39,7 @@ static const char *TAG = "HTTP-AT";
 
 #define RINGBUF_SIZE   (4 * 1024)
 #define RECV_CHUNK     1024
-#define UART_CHUNK     256
+#define UART_CHUNK     512
 static RingbufHandle_t s_rb = NULL;
 static TaskHandle_t s_uart_task = NULL;
 static bool s_http_busy = false;  // 并发控制标志
@@ -329,7 +329,7 @@ static uint8_t at_setup_cmd_httpp(uint8_t para_num)
 
     at_http_get_start(web_host, web_port, web_path);
 
-    return ESP_AT_RESULT_CODE_PROCESS_DONE;
+    return ESP_AT_RESULT_CODE_OK;
 }
 
 static uint8_t at_setup_cmd_uart_common(uint8_t para_num, bool save_to_flash)
