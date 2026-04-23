@@ -282,14 +282,17 @@ static void http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_pa
                 // 3. 如果這個封包已經包含了部分 Body 數據，將其拋出
                 if (i < r) {
                     int body_len = r - i;
-                    esp_at_port_write_data((uint8_t *)"+HTTPP", 6);
-                    esp_at_port_write_data((uint8_t *)(data_buf + i), body_len);
-                    vTaskDelay(50/portTICK_PERIOD_MS);
+                    // esp_at_port_write_data((uint8_t *)"+HTTPP", 6);
+                    // esp_at_port_write_data((uint8_t *)(data_buf + i), body_len);
+                    int total_len = snprintf(recv_buf, sizeof(recv_buf), "%s", "+HTTPP");
+                    memcpy(recv_buf + total_len, data_buf + i, body_len);
+                    esp_at_port_write_data((uint8_t *)recv_buf, (total_len+body_len));
+                    vTaskDelay(80/portTICK_PERIOD_MS);
                 }
             } else {
                 // 整個封包都還是 Header
                 esp_at_port_write_data((uint8_t*)data_buf, r);
-                vTaskDelay(50/portTICK_PERIOD_MS);
+                vTaskDelay(80/portTICK_PERIOD_MS);
             }
             
         } else {
@@ -297,9 +300,8 @@ static void http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_pa
             // 直接在預留的內存前綴寫入 "+HTTPP"，減少一次內存搬運
             memcpy(recv_buf, "+HTTPP", 6);
             esp_at_port_write_data((uint8_t*)recv_buf, r + 6);
-            vTaskDelay(50/portTICK_PERIOD_MS);
+            vTaskDelay(80/portTICK_PERIOD_MS);
         }
-        
         // 給 FreeRTOS 其他任務 (如 AT Parser 本身) 釋放時間片
     }
 
