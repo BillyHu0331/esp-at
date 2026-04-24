@@ -37,9 +37,9 @@
 
 static const char *TAG = "HTTP-AT";
 
-#define RINGBUF_SIZE   (4 * 1024)
+#define RINGBUF_SIZE   (8 * 1024)
 #define RECV_CHUNK     1024
-#define UART_CHUNK     512
+#define UART_CHUNK     256
 static RingbufHandle_t s_rb = NULL;
 static TaskHandle_t s_uart_task = NULL;
 static bool s_http_busy = false;  // 并发控制标志
