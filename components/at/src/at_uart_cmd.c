@@ -36,7 +36,8 @@ static const char *TAG = "HTTP-AT";
 #define HTTPP_PREFIX                             "+HTTPP"
 #define HTTPP_PREFIX_LEN                         6
 #define HTTPP_SOCKET_RECV_SIZE                   512
-#define HTTPP_BODY_PAYLOAD_CHUNK_SIZE            64
+#define HTTPP_UART_PACKET_GAP_MS                 2
+#define HTTPP_BODY_PAYLOAD_CHUNK_SIZE            128
 #define HTTPP_UART_WAIT_MARGIN_MS                50
 #define HTTPP_UART_WAIT_TIMEOUT_MAX_MS           15000
 
@@ -231,7 +232,7 @@ static bool httpp_uart_write_packet(const uint8_t *data, size_t len)
     return true;
 }
 
-static bool httpp_uart_write_body_packets(const uint8_t *data, size_t len)
+static bool httpp_uart_write_body_packets(const uint8_t *data, size_t len, bool add_gap)
 {
     uint8_t packet_buf[HTTPP_PREFIX_LEN + HTTPP_BODY_PAYLOAD_CHUNK_SIZE];
     size_t offset = 0;
@@ -250,6 +251,10 @@ static bool httpp_uart_write_body_packets(const uint8_t *data, size_t len)
         }
 
         offset += payload_len;
+    }
+
+    if (add_gap) {
+        vTaskDelay(HTTPP_UART_PACKET_GAP_MS / portTICK_PERIOD_MS);
     }
 
     return true;
@@ -371,7 +376,7 @@ static bool http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_pa
                 // 3. 如果這個封包已經包含了部分 Body 數據，將其拋出
                 if ((size_t)i < header_len) {
                     size_t body_len = header_len - (size_t)i;
-                    if (!httpp_uart_write_body_packets(header_buf + i, body_len)) {
+                    if (!httpp_uart_write_body_packets(header_buf + i, body_len, true)) {
                         success = false;
                         goto cleanup;
                     }
@@ -386,7 +391,7 @@ static bool http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_pa
             
         } else {
             // Header 已處理完畢，純 Body 按 +HTTPP 分包透傳
-            if (!httpp_uart_write_body_packets((const uint8_t *)recv_buf, r)) {
+            if (!httpp_uart_write_body_packets((const uint8_t *)recv_buf, r, true)) {
                 success = false;
                 goto cleanup;
             }
