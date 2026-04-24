@@ -38,6 +38,7 @@ static const char *TAG = "HTTP-AT";
 #define HTTPP_UART_WRITE_CHUNK_SIZE              64
 #define HTTPP_UART_WAIT_MARGIN_MS                50
 #define HTTPP_UART_WAIT_TIMEOUT_MAX_MS           15000
+bool success = true;
 
 static uint8_t at_setup_cmd_uart_common(uint8_t para_num, bool save_to_flash)
 {
@@ -307,7 +308,7 @@ static bool http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_pa
     char *data_buf = recv_buf + HTTPP_PREFIX_LEN; // 預留前綴空間，保持 +HTTPP 與原始資料連續
     bool header_done = false;
     uint8_t match_state = 0;
-    bool success = true;
+    // bool success = true;
 
     // 循環讀取 Socket，直到對端關閉連接或超時
     while ((r = read(s, data_buf, HTTPP_SOCKET_RECV_SIZE)) > 0) {
