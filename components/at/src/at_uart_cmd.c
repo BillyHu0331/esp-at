@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include "sdkconfig.h"
@@ -35,10 +36,9 @@ static const char *TAG = "HTTP-AT";
 #define HTTPP_PREFIX                             "+HTTPP"
 #define HTTPP_PREFIX_LEN                         6
 #define HTTPP_SOCKET_RECV_SIZE                   512
-#define HTTPP_UART_WRITE_CHUNK_SIZE              64
+#define HTTPP_BODY_PAYLOAD_CHUNK_SIZE            64
 #define HTTPP_UART_WAIT_MARGIN_MS                50
 #define HTTPP_UART_WAIT_TIMEOUT_MAX_MS           15000
-bool success = true;
 
 static uint8_t at_setup_cmd_uart_common(uint8_t para_num, bool save_to_flash)
 {
@@ -211,32 +211,45 @@ static int32_t httpp_get_uart_wait_timeout_ms(size_t len, uint32_t baudrate)
     return (int32_t)timeout_ms;
 }
 
-static bool httpp_uart_write_all(const uint8_t *data, size_t len)
+static bool httpp_uart_write_packet(const uint8_t *data, size_t len)
 {
-    size_t offset = 0;
     uint32_t baudrate = AT_UART_BAUD_RATE_DEF;
 
     uart_get_baudrate(at_uart_port_get(), &baudrate);
 
+    int32_t written = esp_at_port_write_data((uint8_t *)data, len);
+    if (written != (int32_t)len) {
+        ESP_LOGE(TAG, "uart write failed, len=%u written=%d", (unsigned int)len, (int)written);
+        return false;
+    }
+
+    if (!esp_at_port_wait_write_complete(httpp_get_uart_wait_timeout_ms(len, baudrate))) {
+        ESP_LOGE(TAG, "uart wait timeout, len=%u", (unsigned int)len);
+        return false;
+    }
+
+    return true;
+}
+
+static bool httpp_uart_write_body_packets(const uint8_t *data, size_t len)
+{
+    uint8_t packet_buf[HTTPP_PREFIX_LEN + HTTPP_BODY_PAYLOAD_CHUNK_SIZE];
+    size_t offset = 0;
+
+    memcpy(packet_buf, HTTPP_PREFIX, HTTPP_PREFIX_LEN);
+
     while (offset < len) {
-        size_t chunk_len = len - offset;
-        if (chunk_len > HTTPP_UART_WRITE_CHUNK_SIZE) {
-            chunk_len = HTTPP_UART_WRITE_CHUNK_SIZE;
+        size_t payload_len = len - offset;
+        if (payload_len > HTTPP_BODY_PAYLOAD_CHUNK_SIZE) {
+            payload_len = HTTPP_BODY_PAYLOAD_CHUNK_SIZE;
         }
 
-        int32_t written = esp_at_port_write_data((uint8_t *)data + offset, chunk_len);
-        if (written <= 0) {
-            ESP_LOGE(TAG, "uart write failed, offset=%u len=%u written=%d",
-                     (unsigned int)offset, (unsigned int)chunk_len, (int)written);
+        memcpy(packet_buf + HTTPP_PREFIX_LEN, data + offset, payload_len);
+        if (!httpp_uart_write_packet(packet_buf, HTTPP_PREFIX_LEN + payload_len)) {
             return false;
         }
 
-        offset += (size_t)written;
-
-        if (!esp_at_port_wait_write_complete(httpp_get_uart_wait_timeout_ms((size_t)written, baudrate))) {
-            ESP_LOGE(TAG, "uart wait timeout, written=%d", (int)written);
-            return false;
-        }
+        offset += payload_len;
     }
 
     return true;
@@ -304,69 +317,78 @@ static bool http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_pa
     }
 
     // HTTP 解析狀態機配置
-    char recv_buf[HTTPP_SOCKET_RECV_SIZE + HTTPP_PREFIX_LEN] = {0};
-    char *data_buf = recv_buf + HTTPP_PREFIX_LEN; // 預留前綴空間，保持 +HTTPP 與原始資料連續
+    char recv_buf[HTTPP_SOCKET_RECV_SIZE] = {0};
     bool header_done = false;
     uint8_t match_state = 0;
-    // bool success = true;
+    bool success = true;
+    uint8_t *header_buf = NULL;
+    size_t header_len = 0;
 
     // 循環讀取 Socket，直到對端關閉連接或超時
-    while ((r = read(s, data_buf, HTTPP_SOCKET_RECV_SIZE)) > 0) {
+    while ((r = read(s, recv_buf, HTTPP_SOCKET_RECV_SIZE)) > 0) {
         if (!header_done) {
+            uint8_t *new_header_buf = realloc(header_buf, header_len + r);
+            if (new_header_buf == NULL) {
+                ESP_LOGE(TAG, "no mem for http header, header_len=%u append=%d",
+                         (unsigned int)header_len, r);
+                success = false;
+                goto cleanup;
+            }
+            header_buf = new_header_buf;
+            memcpy(header_buf + header_len, recv_buf, r);
+            header_len += (size_t)r;
+
+            match_state = 0;
             int i;
-            for (i = 0; i < r; i++) {
+            for (i = 0; i < (int)header_len; i++) {
                 // 狀態機：精準捕獲 \r\n\r\n 邊界，完美解決跨包截斷問題
-                if (data_buf[i] == '\r' && match_state == 0) match_state = 1;
-                else if (data_buf[i] == '\n' && match_state == 1) match_state = 2;
-                else if (data_buf[i] == '\r' && match_state == 2) match_state = 3;
-                else if (data_buf[i] == '\n' && match_state == 3) {
+                if (header_buf[i] == '\r' && match_state == 0) match_state = 1;
+                else if (header_buf[i] == '\n' && match_state == 1) match_state = 2;
+                else if (header_buf[i] == '\r' && match_state == 2) match_state = 3;
+                else if (header_buf[i] == '\n' && match_state == 3) {
                     match_state = 4;
                     header_done = true;
                     i++; // 將指針移向 Body 的首字節
                     break;
                 } else {
-                    if (data_buf[i] == '\r') match_state = 1; // 容錯處理 \r\r\n
+                    if (header_buf[i] == '\r') match_state = 1; // 容錯處理 \r\r\n
                     else match_state = 0;
                 }
             }
 
             if (header_done) {
-                // 1. 輸出最後一部分的 Header
                 if (i > 0) {
-                    if (!httpp_uart_write_all((uint8_t *)data_buf, i)) {
+                    // header 必須整體一次輸出，不能拆包
+                    if (!httpp_uart_write_packet(header_buf, i)) {
                         success = false;
                         goto cleanup;
                     }
                 }
                 // 2. 插入分隔標記
-                if (!httpp_uart_write_all((const uint8_t *)"\r\nOK\r\n", 6)) {
+                if (!httpp_uart_write_packet((const uint8_t *)"\r\nOK\r\n", 6)) {
                     success = false;
                     goto cleanup;
                 }
 
                 // 3. 如果這個封包已經包含了部分 Body 數據，將其拋出
-                if (i < r) {
-                    int body_len = r - i;
-                    char *body_with_prefix = recv_buf + i;
-                    memcpy(body_with_prefix, HTTPP_PREFIX, HTTPP_PREFIX_LEN);
-                    if (!httpp_uart_write_all((uint8_t *)body_with_prefix, HTTPP_PREFIX_LEN + body_len)) {
+                if ((size_t)i < header_len) {
+                    size_t body_len = header_len - (size_t)i;
+                    if (!httpp_uart_write_body_packets(header_buf + i, body_len)) {
                         success = false;
                         goto cleanup;
                     }
                 }
+
+                free(header_buf);
+                header_buf = NULL;
+                header_len = 0;
             } else {
-                // 整個封包都還是 Header
-                if (!httpp_uart_write_all((uint8_t *)data_buf, r)) {
-                    success = false;
-                    goto cleanup;
-                }
+                continue;
             }
             
         } else {
-            // Header 已處理完畢，純 Body 透傳
-            // 直接在預留的內存前綴寫入 "+HTTPP"，保持原協議格式不變
-            memcpy(recv_buf, HTTPP_PREFIX, HTTPP_PREFIX_LEN);
-            if (!httpp_uart_write_all((uint8_t *)recv_buf, r + HTTPP_PREFIX_LEN)) {
+            // Header 已處理完畢，純 Body 按 +HTTPP 分包透傳
+            if (!httpp_uart_write_body_packets((const uint8_t *)recv_buf, r)) {
                 success = false;
                 goto cleanup;
             }
@@ -374,12 +396,19 @@ static bool http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_pa
     }
 
     ESP_LOGI(TAG, "...done reading from socket. Last read return = %d errno = %d.", r, errno);
+    if (!header_done) {
+        ESP_LOGE(TAG, "...http header incomplete, len=%u", (unsigned int)header_len);
+        success = false;
+    }
     if (r < 0) {
         ESP_LOGE(TAG, "...socket recv failed/timeout error=%d", errno);
         success = false;
     }
 
 cleanup:
+    if (header_buf != NULL) {
+        free(header_buf);
+    }
     if (res != NULL) {
         freeaddrinfo(res);
     }
