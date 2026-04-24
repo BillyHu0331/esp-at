@@ -264,6 +264,12 @@ static bool http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_pa
     struct addrinfo *res = NULL;
     struct in_addr  *addr;
     int s = -1, r;
+    char recv_buf[HTTPP_SOCKET_RECV_SIZE] = {0};
+    bool header_done = false;
+    uint8_t match_state = 0;
+    bool success = true;
+    uint8_t *header_buf = NULL;
+    size_t header_len = 0;
 
     // 擴大 Request Buffer，防止長 URL 導致棧溢出
     char request[256] = {0}; 
@@ -315,14 +321,6 @@ static bool http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_pa
         ESP_LOGE(TAG, "...failed to set socket receiving timeout");
         goto cleanup;
     }
-
-    // HTTP 解析狀態機配置
-    char recv_buf[HTTPP_SOCKET_RECV_SIZE] = {0};
-    bool header_done = false;
-    uint8_t match_state = 0;
-    bool success = true;
-    uint8_t *header_buf = NULL;
-    size_t header_len = 0;
 
     // 循環讀取 Socket，直到對端關閉連接或超時
     while ((r = read(s, recv_buf, HTTPP_SOCKET_RECV_SIZE)) > 0) {
