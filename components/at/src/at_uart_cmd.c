@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <errno.h>
 #include "sdkconfig.h"
 
 #ifdef CONFIG_AT_UART_COMMAND_SUPPORT
@@ -25,21 +26,23 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
-#include "lwip/err.h"
-#include "lwip/sockets.h"
-#include "lwip/sys.h"
-#include "lwip/netdb.h"
-#include "lwip/dns.h"
+#include "esp_http_client.h"
 
 static const char *TAG = "HTTP-AT";
 
 #define HTTPP_PREFIX                             "+HTTPP"
 #define HTTPP_PREFIX_LEN                         6
-#define HTTPP_SOCKET_RECV_SIZE                   512
-#define HTTPP_UART_PACKET_GAP_MS                 2
-#define HTTPP_BODY_PAYLOAD_CHUNK_SIZE            128
+#define HTTPP_SOCKET_RECV_SIZE                   1024
+#define HTTPP_UART_PACKET_GAP_MS                 20
+#define HTTPP_BODY_PAYLOAD_CHUNK_SIZE            512
 #define HTTPP_UART_WAIT_MARGIN_MS                50
 #define HTTPP_UART_WAIT_TIMEOUT_MAX_MS           15000
+#define HTTPP_REQUEST_TIMEOUT_MS                 30000
+#define HTTPP_HEADER_BUF_MAX_SIZE                4096
+#define HTTPP_RESUME_MAX_ATTEMPTS                5
+#define HTTPP_KEEPALIVE_IDLE_SEC                 10
+#define HTTPP_KEEPALIVE_INTERVAL_SEC             5
+#define HTTPP_KEEPALIVE_COUNT                    3
 
 static uint8_t at_setup_cmd_uart_common(uint8_t para_num, bool save_to_flash)
 {
@@ -260,166 +263,357 @@ static bool httpp_uart_write_body_packets(const uint8_t *data, size_t len, bool 
     return true;
 }
 
-static bool http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_path)
+typedef struct {
+    uint8_t *header_buf;
+    size_t header_len;
+} httpp_http_ctx_t;
+
+static const char *httpp_http_status_reason_phrase(int status_code)
 {
-    const struct addrinfo hints = {
-        .ai_family = AF_INET,
-        .ai_socktype = SOCK_STREAM,
-    };
-    struct addrinfo *res = NULL;
-    struct in_addr  *addr;
-    int s = -1, r;
+    switch (status_code) {
+    case 100: return "Continue";
+    case 101: return "Switching Protocols";
+    case 200: return "OK";
+    case 201: return "Created";
+    case 202: return "Accepted";
+    case 204: return "No Content";
+    case 206: return "Partial Content";
+    case 300: return "Multiple Choices";
+    case 301: return "Moved Permanently";
+    case 302: return "Found";
+    case 304: return "Not Modified";
+    case 307: return "Temporary Redirect";
+    case 308: return "Permanent Redirect";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 408: return "Request Timeout";
+    case 409: return "Conflict";
+    case 410: return "Gone";
+    case 413: return "Payload Too Large";
+    case 414: return "URI Too Long";
+    case 415: return "Unsupported Media Type";
+    case 429: return "Too Many Requests";
+    case 500: return "Internal Server Error";
+    case 501: return "Not Implemented";
+    case 502: return "Bad Gateway";
+    case 503: return "Service Unavailable";
+    case 504: return "Gateway Timeout";
+    default:  return "Unknown";
+    }
+}
+
+static bool httpp_http_append_header(httpp_http_ctx_t *ctx, const char *data, size_t len)
+{
+    if (len == 0) {
+        return true;
+    }
+
+    if (ctx->header_len >= HTTPP_HEADER_BUF_MAX_SIZE) {
+        ESP_LOGE(TAG, "http header buffer already full, len=%u",
+                 (unsigned int)ctx->header_len);
+        return false;
+    }
+
+    if (len > (HTTPP_HEADER_BUF_MAX_SIZE - ctx->header_len)) {
+        ESP_LOGE(TAG, "http header too large, current=%u append=%u",
+                 (unsigned int)ctx->header_len, (unsigned int)len);
+        return false;
+    }
+
+    uint8_t *new_buf = realloc(ctx->header_buf, ctx->header_len + len);
+    if (new_buf == NULL) {
+        ESP_LOGE(TAG, "no mem for http header, header_len=%u append=%u",
+                 (unsigned int)ctx->header_len, (unsigned int)len);
+        return false;
+    }
+
+    ctx->header_buf = new_buf;
+    memcpy(ctx->header_buf + ctx->header_len, data, len);
+    ctx->header_len += len;
+    return true;
+}
+
+static bool httpp_http_append_header_line(httpp_http_ctx_t *ctx, const char *key, const char *value)
+{
+    if (!httpp_http_append_header(ctx, key, strlen(key))) {
+        return false;
+    }
+    if (!httpp_http_append_header(ctx, ": ", 2)) {
+        return false;
+    }
+    if (!httpp_http_append_header(ctx, value, strlen(value))) {
+        return false;
+    }
+    return httpp_http_append_header(ctx, "\r\n", 2);
+}
+
+static esp_err_t httpp_http_event_handler(esp_http_client_event_t *evt)
+{
+    httpp_http_ctx_t *ctx = (httpp_http_ctx_t *)evt->user_data;
+
+    if (ctx == NULL) {
+        return ESP_OK;
+    }
+
+    switch (evt->event_id) {
+    case HTTP_EVENT_ON_HEADER:
+        if ((evt->header_key == NULL) || (evt->header_value == NULL)) {
+            return ESP_OK;
+        }
+
+        if (!httpp_http_append_header_line(ctx, evt->header_key, evt->header_value)) {
+            return ESP_FAIL;
+        }
+        break;
+    default:
+        break;
+    }
+
+    return ESP_OK;
+}
+
+static bool httpp_http_write_header_packets(esp_http_client_handle_t client, httpp_http_ctx_t *ctx)
+{
+    const char *reason = httpp_http_status_reason_phrase(esp_http_client_get_status_code(client));
+    char status_line[64];
+    int status_line_len = snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n",
+                                   esp_http_client_get_status_code(client), reason);
+    size_t total_len;
+    uint8_t *packet_buf;
+    bool success = false;
+
+    if ((status_line_len < 0) || (status_line_len >= sizeof(status_line))) {
+        ESP_LOGE(TAG, "http status line too long");
+        return false;
+    }
+
+    total_len = (size_t)status_line_len + ctx->header_len + 2;
+    packet_buf = malloc(total_len);
+    if (packet_buf == NULL) {
+        ESP_LOGE(TAG, "no mem for http response header, len=%u", (unsigned int)total_len);
+        return false;
+    }
+
+    memcpy(packet_buf, status_line, status_line_len);
+    if (ctx->header_len > 0) {
+        memcpy(packet_buf + status_line_len, ctx->header_buf, ctx->header_len);
+    }
+    memcpy(packet_buf + status_line_len + ctx->header_len, "\r\n", 2);
+
+    success = httpp_uart_write_packet(packet_buf, total_len);
+    free(packet_buf);
+
+    if (!success) {
+        return false;
+    }
+
+    return httpp_uart_write_packet((const uint8_t *)"\r\nOK\r\n", 6);
+}
+
+static bool httpp_http_download_and_forward_body(esp_http_client_handle_t client, long long *out_read)
+{
     char recv_buf[HTTPP_SOCKET_RECV_SIZE] = {0};
-    bool header_done = false;
-    uint8_t match_state = 0;
+    int read_len = 0;
+    long long total_read = 0;
+    bool is_chunked = esp_http_client_is_chunked_response(client);
+    long long content_len = (long long)esp_http_client_get_content_length(client);
+
+    while (1) {
+        read_len = esp_http_client_read(client, recv_buf, sizeof(recv_buf));
+        if (read_len > 0) {
+            total_read += read_len;
+            if (!httpp_uart_write_body_packets((const uint8_t *)recv_buf, (size_t)read_len, true)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (read_len == 0) {
+            break;
+        }
+
+        if ((!is_chunked) && (content_len >= 0) && ((long long)total_read >= content_len)) {
+            break;
+        }
+
+        if (read_len == -ESP_ERR_HTTP_EAGAIN) {
+            ESP_LOGE(TAG, "http read timeout, err=%d recv=%lld expected=%lld",
+                     read_len, total_read, (long long)content_len);
+        } else if (read_len == -ESP_ERR_HTTP_CONNECTION_CLOSED) {
+            ESP_LOGE(TAG, "http connection closed by peer, err=%d recv=%lld expected=%lld",
+                     read_len, total_read, (long long)content_len);
+        } else {
+            ESP_LOGE(TAG, "http fatal read error, err=%d errno=%d(%s) recv=%lld expected=%lld",
+                     read_len, errno, strerror(errno), total_read, (long long)content_len);
+        }
+        if (out_read != NULL) {
+            *out_read = total_read;
+        }
+        return false;
+    }
+
+    if ((!is_chunked) && (content_len >= 0) && ((long long)total_read < content_len)) {
+        ESP_LOGE(TAG, "http body incomplete, read=%lld expected=%lld",
+                 total_read, (long long)content_len);
+        if (out_read != NULL) {
+            *out_read = total_read;
+        }
+        return false;
+    }
+
+    if (out_read != NULL) {
+        *out_read = total_read;
+    }
+
+    return true;
+}
+
+static bool http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_path, bool use_https)
+{
+    char request_url[528] = {0};
+    char host_header[272] = {0};
     bool success = true;
-    uint8_t *header_buf = NULL;
-    size_t header_len = 0;
+    const char *scheme = use_https ? "https" : "http";
+    int url_len = snprintf(request_url, sizeof(request_url), "%s://%s:%s%s", scheme, web_host, web_port, web_path);
+    int host_header_len = snprintf(host_header, sizeof(host_header), "%s:%s", web_host, web_port);
+    long long downloaded_total = 0;
+    long long expected_total = -1;
+    bool header_written = false;
+    int resume_attempts = 0;
 
-    // 擴大 Request Buffer，防止長 URL 導致棧溢出
-    char request[256] = {0}; 
-    int req_len = snprintf(request, sizeof(request), "GET %s HTTP/1.0\r\nHost: %s:%s\r\nUser-Agent: esp-idf/1.0 esp32\r\n\r\n", web_path, web_host, web_port);
-    if ((req_len < 0) || (req_len >= sizeof(request))) {
-        ESP_LOGE(TAG, "request too long");
+    if ((url_len < 0) || (url_len >= sizeof(request_url))) {
+        ESP_LOGE(TAG, "request url too long");
         return false;
     }
-    size_t request_len = (size_t)req_len;
-
-    int err = getaddrinfo((char*)web_host, (char*)web_port, &hints, &res);
-    if (err != 0 || res == NULL) {
-        ESP_LOGI(TAG, "DNS lookup failed err=%d res=%p", err, res);
+    if ((host_header_len < 0) || (host_header_len >= sizeof(host_header))) {
+        ESP_LOGE(TAG, "host header too long");
         return false;
     }
-    addr = &((struct sockaddr_in *)res->ai_addr)->sin_addr;
-    ESP_LOGI(TAG, "DNS lookup successed. IP=%s", inet_ntoa(*addr));
-   
-    s = socket(res->ai_family, res->ai_socktype, 0);
-    if (s < 0) {
-        ESP_LOGE(TAG, "...Failed to allocate socket.");
-        goto cleanup;
-    }
-    
-    if (connect(s, res->ai_addr, res->ai_addrlen) != 0) {
-        ESP_LOGE(TAG, "...socket connect failed error=%d", errno);
-        goto cleanup;
-    }
 
-    ESP_LOGI(TAG, "...connected");
-    freeaddrinfo(res);
-    res = NULL;
+    while (1) {
+        httpp_http_ctx_t http_ctx = {0};
+        esp_http_client_handle_t client = NULL;
+        bool is_open = false;
+        long long one_shot_read = 0;
+        char range_header[64] = {0};
+        esp_http_client_config_t config = {
+            .url = request_url,
+            .transport_type = use_https ? HTTP_TRANSPORT_OVER_SSL : HTTP_TRANSPORT_OVER_TCP,
+            .event_handler = httpp_http_event_handler,
+            .user_data = &http_ctx,
+            .timeout_ms = HTTPP_REQUEST_TIMEOUT_MS,
+            .buffer_size = HTTPP_SOCKET_RECV_SIZE,
+            .disable_auto_redirect = true,
+            .keep_alive_enable = true,
+            .keep_alive_idle = HTTPP_KEEPALIVE_IDLE_SEC,
+            .keep_alive_interval = HTTPP_KEEPALIVE_INTERVAL_SEC,
+            .keep_alive_count = HTTPP_KEEPALIVE_COUNT,
+        };
 
-    size_t sent_len = 0;
-    while (sent_len < request_len) {
-        int write_len = write(s, request + sent_len, request_len - sent_len);
-        if (write_len <= 0) {
-            ESP_LOGE(TAG, "...socket send failed");
+        client = esp_http_client_init(&config);
+        if (client == NULL) {
+            ESP_LOGE(TAG, "http client init failed");
+            return false;
+        }
+
+        esp_http_client_set_method(client, HTTP_METHOD_GET);
+        esp_http_client_set_header(client, "Host", host_header);
+        esp_http_client_set_header(client, "User-Agent", "esp-idf/1.0 esp32");
+        esp_http_client_set_header(client, "Connection", "keep-alive");
+        if (downloaded_total > 0) {
+            int range_len = snprintf(range_header, sizeof(range_header), "bytes=%lld-", downloaded_total);
+            if ((range_len < 0) || (range_len >= sizeof(range_header))) {
+                ESP_LOGE(TAG, "range header too long, offset=%lld", downloaded_total);
+                success = false;
+                goto cleanup;
+            }
+            esp_http_client_set_header(client, "Range", range_header);
+            ESP_LOGW(TAG, "resume download from offset=%lld", downloaded_total);
+        }
+
+        esp_err_t err = esp_http_client_open(client, 0);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+            success = false;
             goto cleanup;
         }
-        sent_len += (size_t)write_len;
-    }
-    ESP_LOGI(TAG, "...socket send success");
-    
-    struct timeval receiving_timeout;
-    receiving_timeout.tv_sec = 5;
-    receiving_timeout.tv_usec = 0;
-    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &receiving_timeout, sizeof(receiving_timeout)) < 0) {
-        ESP_LOGE(TAG, "...failed to set socket receiving timeout");
-        goto cleanup;
-    }
+        is_open = true;
 
-    // 循環讀取 Socket，直到對端關閉連接或超時
-    while ((r = read(s, recv_buf, HTTPP_SOCKET_RECV_SIZE)) > 0) {
-        if (!header_done) {
-            uint8_t *new_header_buf = realloc(header_buf, header_len + r);
-            if (new_header_buf == NULL) {
-                ESP_LOGE(TAG, "no mem for http header, header_len=%u append=%d",
-                         (unsigned int)header_len, r);
+        if ((esp_http_client_fetch_headers(client) < 0) && !esp_http_client_is_chunked_response(client)) {
+            ESP_LOGE(TAG, "HTTP client fetch headers failed");
+            success = false;
+            goto cleanup;
+        }
+
+        int status_code = esp_http_client_get_status_code(client);
+        if (downloaded_total > 0 && status_code != 206) {
+            ESP_LOGE(TAG, "server does not support range resume, status=%d offset=%lld",
+                     status_code, downloaded_total);
+            success = false;
+            goto cleanup;
+        }
+
+        if (!header_written) {
+            if (!httpp_http_write_header_packets(client, &http_ctx)) {
                 success = false;
                 goto cleanup;
             }
-            header_buf = new_header_buf;
-            memcpy(header_buf + header_len, recv_buf, r);
-            header_len += (size_t)r;
+            header_written = true;
 
-            match_state = 0;
-            int i;
-            for (i = 0; i < (int)header_len; i++) {
-                // 狀態機：精準捕獲 \r\n\r\n 邊界，完美解決跨包截斷問題
-                if (header_buf[i] == '\r' && match_state == 0) match_state = 1;
-                else if (header_buf[i] == '\n' && match_state == 1) match_state = 2;
-                else if (header_buf[i] == '\r' && match_state == 2) match_state = 3;
-                else if (header_buf[i] == '\n' && match_state == 3) {
-                    match_state = 4;
-                    header_done = true;
-                    i++; // 將指針移向 Body 的首字節
-                    break;
-                } else {
-                    if (header_buf[i] == '\r') match_state = 1; // 容錯處理 \r\r\n
-                    else match_state = 0;
-                }
-            }
-
-            if (header_done) {
-                if (i > 0) {
-                    // header 必須整體一次輸出，不能拆包
-                    if (!httpp_uart_write_packet(header_buf, i)) {
-                        success = false;
-                        goto cleanup;
-                    }
-                }
-                // 2. 插入分隔標記
-                if (!httpp_uart_write_packet((const uint8_t *)"\r\nOK\r\n", 6)) {
-                    success = false;
-                    goto cleanup;
-                }
-
-                // 3. 如果這個封包已經包含了部分 Body 數據，將其拋出
-                if ((size_t)i < header_len) {
-                    size_t body_len = header_len - (size_t)i;
-                    if (!httpp_uart_write_body_packets(header_buf + i, body_len, true)) {
-                        success = false;
-                        goto cleanup;
-                    }
-                }
-
-                free(header_buf);
-                header_buf = NULL;
-                header_len = 0;
-            } else {
-                continue;
-            }
-            
-        } else {
-            // Header 已處理完畢，純 Body 按 +HTTPP 分包透傳
-            if (!httpp_uart_write_body_packets((const uint8_t *)recv_buf, r, true)) {
-                success = false;
-                goto cleanup;
+            if (!esp_http_client_is_chunked_response(client)) {
+                expected_total = (long long)esp_http_client_get_content_length(client);
+                ESP_LOGI(TAG, "download expected total=%lld", expected_total);
             }
         }
-    }
 
-    ESP_LOGI(TAG, "...done reading from socket. Last read return = %d errno = %d.", r, errno);
-    if (!header_done) {
-        ESP_LOGE(TAG, "...http header incomplete, len=%u", (unsigned int)header_len);
-        success = false;
-    }
-    if (r < 0) {
-        ESP_LOGE(TAG, "...socket recv failed/timeout error=%d", errno);
-        success = false;
-    }
+        if (!httpp_http_download_and_forward_body(client, &one_shot_read)) {
+            downloaded_total += one_shot_read;
+
+            if ((expected_total < 0) || (downloaded_total <= 0) || (resume_attempts >= HTTPP_RESUME_MAX_ATTEMPTS)) {
+                success = false;
+                goto cleanup;
+            }
+
+            resume_attempts++;
+            ESP_LOGW(TAG, "resume attempt %d/%d, downloaded=%lld/%lld",
+                     resume_attempts, HTTPP_RESUME_MAX_ATTEMPTS,
+                     downloaded_total, expected_total);
+            success = true;
+            goto cleanup;
+        }
+
+        downloaded_total += one_shot_read;
+        resume_attempts = 0;
+
+        if ((expected_total >= 0) && (downloaded_total < expected_total)) {
+            ESP_LOGW(TAG, "segment completed, continue range resume downloaded=%lld/%lld",
+                     downloaded_total, expected_total);
+            success = true;
+            goto cleanup;
+        }
+
+        success = true;
 
 cleanup:
-    if (header_buf != NULL) {
-        free(header_buf);
-    }
-    if (res != NULL) {
-        freeaddrinfo(res);
-    }
-    if (s >= 0) {
-        close(s);
-    }
+        free(http_ctx.header_buf);
+        if (client != NULL) {
+            if (is_open) {
+                esp_http_client_close(client);
+            }
+            esp_http_client_cleanup(client);
+        }
 
-    return success;
+        if (!success) {
+            return false;
+        }
+
+        if ((expected_total < 0) || (downloaded_total >= expected_total)) {
+            return true;
+        }
+    }
 }
 
 static uint8_t at_setup_cmd_httpp(uint8_t para_num)
@@ -428,6 +622,7 @@ static uint8_t at_setup_cmd_httpp(uint8_t para_num)
     char web_path[256] = {0}; // 擴大 Buffer 避免長路徑溢出
     char web_port[8] = "80";  // 預設 Port 為 80
     char web_host[256] = {0};
+    bool use_https = false;
     uint8_t cnt = 0;
     char *p_host_start;
     char *p_path_start;
@@ -440,12 +635,16 @@ static uint8_t at_setup_cmd_httpp(uint8_t para_num)
         return ESP_AT_RESULT_CODE_ERROR;
     }
 
-    // 1. 過濾掉 "://" 前綴 (如果存在)
-    p_host_start = strstr((char *)web_url, "://");
-    if (p_host_start) {
-        p_host_start += 3;
+    // 1. 解析 URL 協議與 Host 起點
+    if (strncmp((char *)web_url, "https://", 8) == 0) {
+        use_https = true;
+        strncpy(web_port, "443", sizeof(web_port) - 1);
+        web_port[sizeof(web_port) - 1] = '\0';
+        p_host_start = (char *)web_url + 8;
+    } else if (strncmp((char *)web_url, "http://", 7) == 0) {
+        p_host_start = (char *)web_url + 7;
     } else {
-        p_host_start = (char *)web_url; 
+        p_host_start = (char *)web_url;
     }
 
     // 2. 尋找 Path 的起點 '/'
@@ -477,9 +676,10 @@ static uint8_t at_setup_cmd_httpp(uint8_t para_num)
     if (p_port) {
         *p_port = '\0'; // 截斷 Host 字串
         strncpy(web_port, p_port + 1, sizeof(web_port) - 1);
+        web_port[sizeof(web_port) - 1] = '\0';
     }
 
-    if (!http_get_param((uint8_t *)web_host, (uint8_t *)web_port, (uint8_t *)web_path)) {
+    if (!http_get_param((uint8_t *)web_host, (uint8_t *)web_port, (uint8_t *)web_path, use_https)) {
         return ESP_AT_RESULT_CODE_ERROR;
     }
 
