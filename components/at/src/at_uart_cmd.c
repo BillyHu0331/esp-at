@@ -25,8 +25,9 @@
 
 #include "esp_wifi.h"
 #include "esp_event.h"
-#include "esp_log.h"
 #include "esp_http_client.h"
+#include "esp_tls.h"
+#include "esp_transport.h"
 
 static const char *TAG = "HTTP-AT";
 
@@ -43,6 +44,28 @@ static const char *TAG = "HTTP-AT";
 #define HTTPP_KEEPALIVE_IDLE_SEC                 10
 #define HTTPP_KEEPALIVE_INTERVAL_SEC             5
 #define HTTPP_KEEPALIVE_COUNT                    3
+
+#define HTTPP_DBG_LEVEL_NONE     0
+#define HTTPP_DBG_LEVEL_ERROR   1
+#define HTTPP_DBG_LEVEL_WARN    2
+#define HTTPP_DBG_LEVEL_INFO    3
+#define HTTPP_DBG_LEVEL_DEBUG   4
+
+#define HTTPP_DBG_LEVEL          HTTPP_DBG_LEVEL_NONE
+
+#define HTTPP_DBG_PRINTF(fmt, ...) do { \
+        char _dbg_buf[256]; \
+        int _dbg_len = snprintf(_dbg_buf, sizeof(_dbg_buf), "[HTTPP-DBG] " fmt "\r\n", ##__VA_ARGS__); \
+        if (_dbg_len > 0) { \
+            esp_at_port_write_data((uint8_t *)_dbg_buf, (size_t)_dbg_len); \
+        } \
+    } while (0)
+
+#define HTTPP_DBG(level, fmt, ...) do { \
+        if ((level) <= HTTPP_DBG_LEVEL) { \
+            HTTPP_DBG_PRINTF(fmt, ##__VA_ARGS__); \
+        } \
+    } while (0)
 
 static uint8_t at_setup_cmd_uart_common(uint8_t para_num, bool save_to_flash)
 {
@@ -223,12 +246,12 @@ static bool httpp_uart_write_packet(const uint8_t *data, size_t len)
 
     int32_t written = esp_at_port_write_data((uint8_t *)data, len);
     if (written != (int32_t)len) {
-        ESP_LOGE(TAG, "uart write failed, len=%u written=%d", (unsigned int)len, (int)written);
+        HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "uart write failed, len=%u written=%d", (unsigned int)len, (int)written);
         return false;
     }
 
     if (!esp_at_port_wait_write_complete(httpp_get_uart_wait_timeout_ms(len, baudrate))) {
-        ESP_LOGE(TAG, "uart wait timeout, len=%u", (unsigned int)len);
+        HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "uart wait timeout, len=%u", (unsigned int)len);
         return false;
     }
 
@@ -266,6 +289,10 @@ static bool httpp_uart_write_body_packets(const uint8_t *data, size_t len, bool 
 typedef struct {
     uint8_t *header_buf;
     size_t header_len;
+    bool have_last_error;
+    esp_err_t last_error;
+    int last_tls_code;
+    int last_tls_flags;
 } httpp_http_ctx_t;
 
 static const char *httpp_http_status_reason_phrase(int status_code)
@@ -312,20 +339,20 @@ static bool httpp_http_append_header(httpp_http_ctx_t *ctx, const char *data, si
     }
 
     if (ctx->header_len >= HTTPP_HEADER_BUF_MAX_SIZE) {
-        ESP_LOGE(TAG, "http header buffer already full, len=%u",
+        HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "http header buffer already full, len=%u",
                  (unsigned int)ctx->header_len);
         return false;
     }
 
     if (len > (HTTPP_HEADER_BUF_MAX_SIZE - ctx->header_len)) {
-        ESP_LOGE(TAG, "http header too large, current=%u append=%u",
+        HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "http header too large, current=%u append=%u",
                  (unsigned int)ctx->header_len, (unsigned int)len);
         return false;
     }
 
     uint8_t *new_buf = realloc(ctx->header_buf, ctx->header_len + len);
     if (new_buf == NULL) {
-        ESP_LOGE(TAG, "no mem for http header, header_len=%u append=%u",
+        HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "no mem for http header, header_len=%u append=%u",
                  (unsigned int)ctx->header_len, (unsigned int)len);
         return false;
     }
@@ -359,6 +386,13 @@ static esp_err_t httpp_http_event_handler(esp_http_client_event_t *evt)
     }
 
     switch (evt->event_id) {
+    case HTTP_EVENT_ERROR:
+        if (evt->data != NULL) {
+            esp_tls_error_handle_t tls_err = (esp_tls_error_handle_t)evt->data;
+            ctx->have_last_error = true;
+            ctx->last_error = esp_tls_get_and_clear_last_error(tls_err, &ctx->last_tls_code, &ctx->last_tls_flags);
+        }
+        break;
     case HTTP_EVENT_ON_HEADER:
         if ((evt->header_key == NULL) || (evt->header_value == NULL)) {
             return ESP_OK;
@@ -386,14 +420,14 @@ static bool httpp_http_write_header_packets(esp_http_client_handle_t client, htt
     bool success = false;
 
     if ((status_line_len < 0) || (status_line_len >= sizeof(status_line))) {
-        ESP_LOGE(TAG, "http status line too long");
+        HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "http status line too long");
         return false;
     }
 
-    total_len = (size_t)status_line_len + ctx->header_len + 2;
+    total_len = (size_t)status_line_len + ctx->header_len + 4;
     packet_buf = malloc(total_len);
     if (packet_buf == NULL) {
-        ESP_LOGE(TAG, "no mem for http response header, len=%u", (unsigned int)total_len);
+        HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "no mem for http response header, len=%u", (unsigned int)total_len);
         return false;
     }
 
@@ -401,7 +435,7 @@ static bool httpp_http_write_header_packets(esp_http_client_handle_t client, htt
     if (ctx->header_len > 0) {
         memcpy(packet_buf + status_line_len, ctx->header_buf, ctx->header_len);
     }
-    memcpy(packet_buf + status_line_len + ctx->header_len, "\r\n", 2);
+    memcpy(packet_buf + status_line_len + ctx->header_len, "\r\n\r\n", 4);
 
     success = httpp_uart_write_packet(packet_buf, total_len);
     free(packet_buf);
@@ -410,7 +444,7 @@ static bool httpp_http_write_header_packets(esp_http_client_handle_t client, htt
         return false;
     }
 
-    return httpp_uart_write_packet((const uint8_t *)"\r\nOK\r\n", 6);
+    return httpp_uart_write_packet((const uint8_t *)"+HTTPP:OK\r\n", 11);
 }
 
 static bool httpp_http_download_and_forward_body(esp_http_client_handle_t client, long long *out_read)
@@ -420,76 +454,93 @@ static bool httpp_http_download_and_forward_body(esp_http_client_handle_t client
     long long total_read = 0;
     bool is_chunked = esp_http_client_is_chunked_response(client);
     long long content_len = (long long)esp_http_client_get_content_length(client);
+    int retry_eagain_count = 0;
+    const int retry_eagain_max = 100;
 
     while (1) {
         read_len = esp_http_client_read(client, recv_buf, sizeof(recv_buf));
         if (read_len > 0) {
             total_read += read_len;
             if (!httpp_uart_write_body_packets((const uint8_t *)recv_buf, (size_t)read_len, true)) {
-                return false;
+                goto failed;
             }
             continue;
         }
 
         if (read_len == 0) {
-            break;
-        }
-
-        if ((!is_chunked) && (content_len >= 0) && ((long long)total_read >= content_len)) {
-            break;
+            if (is_chunked) {
+                break;
+            }
+            if ((content_len >= 0) && ((long long)total_read >= content_len)) {
+                break;
+            }
+            if (content_len < 0) {
+                break;
+            }
+            HTTPP_DBG(HTTPP_DBG_LEVEL_WARN, "server closed connection early, read=%lld expected=%lld",
+                     total_read, (long long)content_len);
+            goto failed;
         }
 
         if (read_len == -ESP_ERR_HTTP_EAGAIN) {
-            ESP_LOGE(TAG, "http read timeout, err=%d recv=%lld expected=%lld",
-                     read_len, total_read, (long long)content_len);
-        } else if (read_len == -ESP_ERR_HTTP_CONNECTION_CLOSED) {
-            ESP_LOGE(TAG, "http connection closed by peer, err=%d recv=%lld expected=%lld",
-                     read_len, total_read, (long long)content_len);
-        } else {
-            ESP_LOGE(TAG, "http fatal read error, err=%d errno=%d(%s) recv=%lld expected=%lld",
-                     read_len, errno, strerror(errno), total_read, (long long)content_len);
+            if ((content_len >= 0) && ((long long)total_read >= content_len)) {
+                break;
+            }
+            retry_eagain_count++;
+            if (retry_eagain_count >= retry_eagain_max) {
+                HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "http read EAGAIN exhausted, max=%d retries reached, recv=%lld expected=%lld",
+                         retry_eagain_max, total_read, (long long)content_len);
+                goto failed;
+            }
+            HTTPP_DBG(HTTPP_DBG_LEVEL_WARN, "http read EAGAIN (recoverable), retry=%d/%d recv=%lld expected=%lld, retrying...",
+                     retry_eagain_count, retry_eagain_max, total_read, (long long)content_len);
+            continue;
         }
-        if (out_read != NULL) {
-            *out_read = total_read;
+
+        if (read_len == -ESP_ERR_HTTP_CONNECTION_CLOSED) {
+            if ((content_len >= 0) && ((long long)total_read >= content_len)) {
+                break;
+            }
+            HTTPP_DBG(HTTPP_DBG_LEVEL_WARN, "http connection closed, recv=%lld expected=%lld",
+                     total_read, (long long)content_len);
+            goto failed;
         }
-        return false;
+
+        HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "http fatal read error, err=%d errno=%d(%s) recv=%lld expected=%lld",
+                 read_len, errno, strerror(errno), total_read, (long long)content_len);
+        goto failed;
     }
 
     if ((!is_chunked) && (content_len >= 0) && ((long long)total_read < content_len)) {
-        ESP_LOGE(TAG, "http body incomplete, read=%lld expected=%lld",
+        HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "http body incomplete, read=%lld expected=%lld",
                  total_read, (long long)content_len);
-        if (out_read != NULL) {
-            *out_read = total_read;
-        }
-        return false;
+        goto failed;
     }
 
     if (out_read != NULL) {
         *out_read = total_read;
     }
-
     return true;
+
+failed:
+    if (out_read != NULL) {
+        *out_read = total_read;
+    }
+    return false;
 }
 
 static bool http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_path, bool use_https)
 {
     char request_url[528] = {0};
-    char host_header[272] = {0};
-    bool success = true;
     const char *scheme = use_https ? "https" : "http";
     int url_len = snprintf(request_url, sizeof(request_url), "%s://%s:%s%s", scheme, web_host, web_port, web_path);
-    int host_header_len = snprintf(host_header, sizeof(host_header), "%s:%s", web_host, web_port);
     long long downloaded_total = 0;
     long long expected_total = -1;
     bool header_written = false;
     int resume_attempts = 0;
 
     if ((url_len < 0) || (url_len >= sizeof(request_url))) {
-        ESP_LOGE(TAG, "request url too long");
-        return false;
-    }
-    if ((host_header_len < 0) || (host_header_len >= sizeof(host_header))) {
-        ESP_LOGE(TAG, "host header too long");
+        HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "request url too long");
         return false;
     }
 
@@ -506,66 +557,107 @@ static bool http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_pa
             .user_data = &http_ctx,
             .timeout_ms = HTTPP_REQUEST_TIMEOUT_MS,
             .buffer_size = HTTPP_SOCKET_RECV_SIZE,
-            .disable_auto_redirect = true,
+            .max_redirection_count = 10,
             .keep_alive_enable = true,
             .keep_alive_idle = HTTPP_KEEPALIVE_IDLE_SEC,
             .keep_alive_interval = HTTPP_KEEPALIVE_INTERVAL_SEC,
             .keep_alive_count = HTTPP_KEEPALIVE_COUNT,
+            .skip_cert_common_name_check = true,
         };
 
         client = esp_http_client_init(&config);
         if (client == NULL) {
-            ESP_LOGE(TAG, "http client init failed");
+            HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "http client init failed");
             return false;
         }
 
         esp_http_client_set_method(client, HTTP_METHOD_GET);
-        esp_http_client_set_header(client, "Host", host_header);
-        esp_http_client_set_header(client, "User-Agent", "esp-idf/1.0 esp32");
-        esp_http_client_set_header(client, "Connection", "keep-alive");
+        esp_http_client_set_header(client, "User-Agent", "Mozilla/5.0 (compatible; esp32)");
+        esp_http_client_set_header(client, "Accept", "*/*");
         if (downloaded_total > 0) {
             int range_len = snprintf(range_header, sizeof(range_header), "bytes=%lld-", downloaded_total);
             if ((range_len < 0) || (range_len >= sizeof(range_header))) {
-                ESP_LOGE(TAG, "range header too long, offset=%lld", downloaded_total);
-                success = false;
-                goto cleanup;
+                HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "range header too long, offset=%lld", downloaded_total);
+                esp_http_client_cleanup(client);
+                return false;
             }
             esp_http_client_set_header(client, "Range", range_header);
-            ESP_LOGW(TAG, "resume download from offset=%lld", downloaded_total);
+            HTTPP_DBG(HTTPP_DBG_LEVEL_WARN, "resume download from offset=%lld", downloaded_total);
         }
 
         esp_err_t err = esp_http_client_open(client, 0);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
-            success = false;
-            goto cleanup;
+            HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "Failed to open HTTP connection: err=0x%x(%s)", err, esp_err_to_name(err));
+            if (http_ctx.have_last_error) {
+                HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "  underlying TLS error: esp_err=0x%x tls_code=0x%x tls_flags=0x%x",
+                         http_ctx.last_error, http_ctx.last_tls_code, http_ctx.last_tls_flags);
+            }
+            free(http_ctx.header_buf);
+            esp_http_client_cleanup(client);
+            return false;
         }
         is_open = true;
 
-        if ((esp_http_client_fetch_headers(client) < 0) && !esp_http_client_is_chunked_response(client)) {
-            ESP_LOGE(TAG, "HTTP client fetch headers failed");
-            success = false;
-            goto cleanup;
+        int64_t fetch_ret = esp_http_client_fetch_headers(client);
+        if ((fetch_ret < 0) && !esp_http_client_is_chunked_response(client)) {
+            HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "HTTP client fetch headers failed, fetch_ret=%lld is_chunked=%d",
+                     fetch_ret, esp_http_client_is_chunked_response(client));
+            free(http_ctx.header_buf);
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            return false;
         }
 
         int status_code = esp_http_client_get_status_code(client);
-        if (downloaded_total > 0 && status_code != 206) {
-            ESP_LOGE(TAG, "server does not support range resume, status=%d offset=%lld",
+        if (status_code < 200 || status_code >= 300) {
+            HTTPP_DBG(HTTPP_DBG_LEVEL_ERROR, "HTTP server returned error status, status=%d offset=%lld",
                      status_code, downloaded_total);
-            success = false;
-            goto cleanup;
+            if (downloaded_total == 0) {
+                free(http_ctx.header_buf);
+                if (client != NULL) {
+                    if (is_open) {
+                        esp_http_client_close(client);
+                    }
+                    esp_http_client_cleanup(client);
+                }
+                return false;
+            }
+            if (status_code != 206) {
+                free(http_ctx.header_buf);
+                if (client != NULL) {
+                    if (is_open) {
+                        esp_http_client_close(client);
+                    }
+                    esp_http_client_cleanup(client);
+                }
+                return false;
+            }
+        }
+
+        if (downloaded_total > 0 && status_code == 200) {
+            HTTPP_DBG(HTTPP_DBG_LEVEL_WARN, "server ignored Range header, resetting download (status=%d)", status_code);
+            downloaded_total = 0;
+            resume_attempts = 0;
+            expected_total = -1;
+            header_written = false;
         }
 
         if (!header_written) {
             if (!httpp_http_write_header_packets(client, &http_ctx)) {
-                success = false;
-                goto cleanup;
+                free(http_ctx.header_buf);
+                if (client != NULL) {
+                    if (is_open) {
+                        esp_http_client_close(client);
+                    }
+                    esp_http_client_cleanup(client);
+                }
+                return false;
             }
             header_written = true;
 
             if (!esp_http_client_is_chunked_response(client)) {
                 expected_total = (long long)esp_http_client_get_content_length(client);
-                ESP_LOGI(TAG, "download expected total=%lld", expected_total);
+                HTTPP_DBG(HTTPP_DBG_LEVEL_INFO, "download expected total=%lld", expected_total);
             }
         }
 
@@ -573,41 +665,31 @@ static bool http_get_param(uint8_t *web_host, uint8_t *web_port, uint8_t *web_pa
             downloaded_total += one_shot_read;
 
             if ((expected_total < 0) || (downloaded_total <= 0) || (resume_attempts >= HTTPP_RESUME_MAX_ATTEMPTS)) {
-                success = false;
-                goto cleanup;
+                free(http_ctx.header_buf);
+                if (client != NULL) {
+                    if (is_open) {
+                        esp_http_client_close(client);
+                    }
+                    esp_http_client_cleanup(client);
+                }
+                return false;
             }
 
             resume_attempts++;
-            ESP_LOGW(TAG, "resume attempt %d/%d, downloaded=%lld/%lld",
+            HTTPP_DBG(HTTPP_DBG_LEVEL_WARN, "resume attempt %d/%d, downloaded=%lld/%lld",
                      resume_attempts, HTTPP_RESUME_MAX_ATTEMPTS,
                      downloaded_total, expected_total);
-            success = true;
-            goto cleanup;
+        } else {
+            downloaded_total += one_shot_read;
+            resume_attempts = 0;
         }
 
-        downloaded_total += one_shot_read;
-        resume_attempts = 0;
-
-        if ((expected_total >= 0) && (downloaded_total < expected_total)) {
-            ESP_LOGW(TAG, "segment completed, continue range resume downloaded=%lld/%lld",
-                     downloaded_total, expected_total);
-            success = true;
-            goto cleanup;
-        }
-
-        success = true;
-
-cleanup:
         free(http_ctx.header_buf);
         if (client != NULL) {
             if (is_open) {
                 esp_http_client_close(client);
             }
             esp_http_client_cleanup(client);
-        }
-
-        if (!success) {
-            return false;
         }
 
         if ((expected_total < 0) || (downloaded_total >= expected_total)) {
