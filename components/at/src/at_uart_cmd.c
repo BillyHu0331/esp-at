@@ -444,7 +444,7 @@ static bool httpp_http_write_header_packets(esp_http_client_handle_t client, htt
         return false;
     }
 
-    return httpp_uart_write_packet((const uint8_t *)"+HTTPP:OK\r\n", 11);
+    return httpp_uart_write_packet((const uint8_t *)"\r\nOK\r\n", 6);
 }
 
 static bool httpp_http_download_and_forward_body(esp_http_client_handle_t client, long long *out_read)
