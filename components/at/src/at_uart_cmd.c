@@ -34,9 +34,9 @@ static const char *TAG = "HTTP-AT";
 #define HTTPP_PREFIX                             "+HTTPP"
 #define HTTPP_PREFIX_LEN                         6
 #define HTTPP_SOCKET_RECV_SIZE                   1024
-#define HTTPP_UART_PACKET_GAP_MS                 20
+#define HTTPP_UART_PACKET_GAP_MS                 5
 #define HTTPP_BODY_PAYLOAD_CHUNK_SIZE            512
-#define HTTPP_UART_WAIT_MARGIN_MS                50
+#define HTTPP_UART_WAIT_MARGIN_MS                10
 #define HTTPP_UART_WAIT_TIMEOUT_MAX_MS           15000
 #define HTTPP_REQUEST_TIMEOUT_MS                 30000
 #define HTTPP_HEADER_BUF_MAX_SIZE                4096
